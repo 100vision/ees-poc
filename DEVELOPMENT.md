@@ -4,7 +4,23 @@
 
 ---
 
-## 架构总览
+## 技术栈
+
+| 模块 | 技术 | 说明 |
+|------|------|------|
+| 开发语言 | Go 1.24+ | 与未来 V1 保持一致 |
+| 目标平台 | Windows 10/11/Server 2019+ | x86_64 (amd64) |
+| Windows Service | `golang.org/x/sys/windows/svc` | SCM 协议、Install/Uninstall/Start/Stop |
+| Explorer 右键菜单 | `golang.org/x/sys/windows/registry` | HKEY_CLASSES_ROOT\exefile\shell |
+| IPC | Windows Named Pipe | `\\.\pipe\ees`，消息模式 |
+| 哈希算法 | `crypto/sha256` | 标准库，零依赖 |
+| 数字签名 | Windows Authenticode API | WinVerifyTrust + CryptQueryObject + CertGetNameString |
+| 提权接口 | Windows API | WTSQueryUserToken → DuplicateTokenEx → CreateProcessAsUser |
+| 配置文件 | JSON | whitelist.json + config.json |
+| 日志 | Go 标准 `log` 包 | 分级输出到文件 |
+| 构建 | Go 交叉编译 | WSL2 → Windows (CGO_ENABLED=0) |
+
+---
 
 ## 架构总览
 
@@ -196,7 +212,7 @@ cp scripts/uninstall.cmd dist/EES/
 
 ---
 
-## 文件清单（28 个源文件）
+## 文件清单（29 个源文件）
 
 ```
 agent/elevate.go
@@ -219,7 +235,7 @@ common/types/types.go
 common/types/types_test.go
 config/config.json
 config/whitelist.json
-docs/DemoGuide.md
+docs/DEPLOY.md
 research/elevation/elevate.go
 research/elevation/main.go
 research/elevation/README.md
