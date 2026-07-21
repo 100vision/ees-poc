@@ -1,0 +1,28 @@
+{
+	"entries": [
+		{
+			"SHA256": "",
+			"Publisher": "Google LLC",
+			"Description": "Google Chrome Installer",
+			"Enabled": true
+		},
+		{
+			"SHA256": "",
+			"Publisher": "Microsoft Corporation",
+			"Description": "Visual Studio Code Installer",
+			"Enabled": true
+		},
+		{
+			"SHA256": "",
+			"Publisher": "Igor Pavlov",
+			"Description": "7-Zip Installer (signed version)",
+			"Enabled": true
+		},
+		{
+			"SHA256": "6745fa76dc2ea031596d8678f6f6b99c3c1b435b4164a63485adbbc7b8d82ef0",
+			"Publisher": "",
+			"Description": "7-Zip 26.02 x64 (unsigned)",
+			"Enabled": true
+		}
+	]
+}

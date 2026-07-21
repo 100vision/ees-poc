@@ -1,0 +1,5 @@
+{
+	"PipeName": "\\\\.\\pipe\\ees",
+	"Whitelist": "config\\whitelist.json",
+	"LogPath": "logs\\agent.log"
+}
