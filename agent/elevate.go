@@ -13,7 +13,7 @@ import (
 
 // Elevation constants.
 const (
-	tokenLinkedTokenClass = 19
+	tokenLinkedTokenClass    = 19
 	createUnicodeEnvironment = 0x00000400
 	createNewConsole         = 0x00000010
 )
@@ -23,12 +23,16 @@ const (
 //	WTSGetActiveConsoleSessionId
 //	→ WTSQueryUserToken
 //	→ DuplicateTokenEx
-//	→ GetLinkedToken (optional — UAC elevation)
+//	→ Branch on user type:
+//	   • Administrator → GetLinkedToken (UAC elevation)
+//	   • Standard user → OpenProcessToken(SYSTEM) + SetSessionId
 //	→ CreateEnvironmentBlock
 //	→ CreateProcessAsUser
 //
 // The engine is designed to run from a SYSTEM context (Windows Service) and
-// launch a process on the active user's desktop with elevated privileges.
+// launches a process on the active user's desktop with elevated privileges:
+// administrators get their linked UAC token, standard users get a SYSTEM token
+// with the active session ID set on it.
 type ElevationEngine struct {
 	logger *log.Logger
 }
@@ -65,29 +69,61 @@ func (e *ElevationEngine) Launch(path string) (uint32, error) {
 	}
 	e.logger.Info("  Primary token obtained")
 
-	// Step 4: Try to get elevated (linked) token for admin privileges
-	elevatedToken, err := e.getLinkedToken(primaryToken)
+	// Step 4: Determine user type and branch elevation strategy
+	//   - Administrator → GetLinkedToken → CreateProcessAsUser (admin privileges)
+	//   - Standard user → SYSTEM token → SetSessionID → CreateProcessAsUser (SYSTEM privileges)
+	isAdmin, err := e.isAdminToken(primaryToken)
 	if err != nil {
-		e.logger.Info("  Linked token: unavailable (using primary token)")
-		elevatedToken = primaryToken
+		e.logger.Warn("  Admin check failed (assuming admin): %v", err)
+		isAdmin = true
+	}
+
+	var execToken windows.Token // token used to launch the process
+	var envToken windows.Token  // token used to create the env block
+
+	if isAdmin {
+		// --- Administrator user path ---
+		e.logger.Info("  User type: Administrator")
+		linked, err := e.getLinkedToken(primaryToken)
+		if err != nil {
+			e.logger.Info("  Linked token unavailable (UAC disabled?), using primary token")
+			execToken = primaryToken
+		} else {
+			e.logger.Info("  Linked (elevated) token obtained")
+			primaryToken.Close()
+			execToken = linked
+		}
+		envToken = execToken
 	} else {
-		e.logger.Info("  Elevated (linked) token obtained")
-		primaryToken.Close()
+		// --- Standard user path ---
+		e.logger.Info("  User type: Standard user — using SYSTEM token for elevation")
+		sysToken, err := e.getSystemTokenForSession(sessionID)
+		if err != nil {
+			primaryToken.Close()
+			return 0, fmt.Errorf("step 4 (SYSTEM token): %w", err)
+		}
+		envToken = primaryToken // user env block preserves user profile vars
+		execToken = sysToken
 	}
 
 	// Step 5: Create environment block for the target user
-	env, err := e.createEnvironmentBlock(elevatedToken)
+	env, err := e.createEnvironmentBlock(envToken)
 	if err != nil {
-		elevatedToken.Close()
+		execToken.Close()
+		if !isAdmin {
+			primaryToken.Close()
+		}
 		return 0, fmt.Errorf("step 5 (env block): %w", err)
 	}
-	e.logger.Info("  Environment block created")
+	if !isAdmin {
+		primaryToken.Close() // env block done, user token no longer needed
+	}
 
 	// Step 6: Launch the process on the user's desktop
 	e.logger.Info("  Launching: %s", path)
-	exitCode, err := e.createProcessAsUser(elevatedToken, path, env)
+	exitCode, err := e.createProcessAsUser(execToken, path, env)
 	e.destroyEnvironmentBlock(env)
-	elevatedToken.Close()
+	execToken.Close()
 
 	if err != nil {
 		return 0, fmt.Errorf("step 6 (launch): %w", err)
@@ -120,7 +156,7 @@ func (e *ElevationEngine) wtsQueryUserToken(sessionID uint32) (windows.Token, er
 // duplicateTokenAsPrimary converts an impersonation token to a primary token.
 func (e *ElevationEngine) duplicateTokenAsPrimary(token windows.Token) (windows.Token, error) {
 	const (
-		tokenPrimary            = 1
+		tokenPrimary               = 1
 		securityImpersonationLevel = 2
 	)
 
@@ -157,6 +193,75 @@ func (e *ElevationEngine) getLinkedToken(token windows.Token) (windows.Token, er
 		return 0, fmt.Errorf("GetTokenInformation(LinkedToken): %w", err)
 	}
 	return linkedToken, nil
+}
+
+// isAdminToken checks whether the given token belongs to a member of the
+// Administrators group (BUILTIN\Administrators, S-1-5-32-544).
+func (e *ElevationEngine) isAdminToken(token windows.Token) (bool, error) {
+	var adminSID *windows.SID
+	err := windows.AllocateAndInitializeSid(
+		&windows.SECURITY_NT_AUTHORITY,
+		2,
+		windows.SECURITY_BUILTIN_DOMAIN_RID,
+		windows.DOMAIN_ALIAS_RID_ADMINS,
+		0, 0, 0, 0, 0, 0,
+		&adminSID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("AllocateAndInitializeSid: %w", err)
+	}
+	defer windows.FreeSid(adminSID)
+
+	var isMember bool
+	err = windows.CheckTokenMembership(token, adminSID, &isMember)
+	if err != nil {
+		return false, fmt.Errorf("CheckTokenMembership: %w", err)
+	}
+	return isMember, nil
+}
+
+// getSystemTokenForSession duplicates the current process (SYSTEM) token,
+// converts it to a primary token, and sets the session ID so the process
+// appears on the correct user desktop when launched with CreateProcessAsUser.
+func (e *ElevationEngine) getSystemTokenForSession(sessionID uint32) (windows.Token, error) {
+	var procToken windows.Token
+	err := windows.OpenProcessToken(
+		windows.GetCurrentProcess(),
+		windows.TOKEN_ALL_ACCESS,
+		&procToken,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("OpenProcessToken: %w", err)
+	}
+	defer procToken.Close()
+
+	var primaryToken windows.Token
+	err = windows.DuplicateTokenEx(
+		procToken,
+		windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ALL_ACCESS,
+		nil,
+		2, // SecurityImpersonation
+		1, // TokenPrimary
+		&primaryToken,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("DuplicateTokenEx: %w", err)
+	}
+
+	// Set session ID so the process launches on the user's desktop, not Session 0.
+	const tokenSessionID = 32
+	err = windows.SetTokenInformation(
+		primaryToken,
+		tokenSessionID,
+		(*byte)(unsafe.Pointer(&sessionID)),
+		uint32(unsafe.Sizeof(sessionID)),
+	)
+	if err != nil {
+		primaryToken.Close()
+		return 0, fmt.Errorf("SetTokenInformation(SessionId=%d): %w", sessionID, err)
+	}
+
+	return primaryToken, nil
 }
 
 // createEnvironmentBlock creates an environment block for the specified token.

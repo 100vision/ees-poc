@@ -61,9 +61,9 @@ func wtsEnumerateSessions() ([]wtsSessionInfo, error) {
 	var count uint32
 
 	err := windows.WTSEnumerateSessions(
-		0,       // WTS_CURRENT_SERVER_HANDLE
-		0,       // Reserved
-		1,       // Version (must be 1)
+		0, // WTS_CURRENT_SERVER_HANDLE
+		0, // Reserved
+		1, // Version (must be 1)
 		&pInfo,
 		&count,
 	)
@@ -99,7 +99,7 @@ func destroyEnvironmentBlock(env *uint16) {
 // that can be used with CreateProcessAsUser.
 func duplicateTokenAsPrimary(token windows.Token) (windows.Token, error) {
 	const (
-		tokenPrimary            = 1
+		tokenPrimary               = 1
 		securityImpersonationLevel = 2
 	)
 
@@ -138,6 +138,75 @@ func getLinkedToken(token windows.Token) (windows.Token, error) {
 	return linkedToken, nil
 }
 
+// isAdminToken checks whether the given token belongs to a member of the
+// Administrators group (BUILTIN\Administrators, S-1-5-32-544).
+func isAdminToken(token windows.Token) (bool, error) {
+	var adminSID *windows.SID
+	err := windows.AllocateAndInitializeSid(
+		&windows.SECURITY_NT_AUTHORITY,
+		2,
+		windows.SECURITY_BUILTIN_DOMAIN_RID,
+		windows.DOMAIN_ALIAS_RID_ADMINS,
+		0, 0, 0, 0, 0, 0,
+		&adminSID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("AllocateAndInitializeSid: %w", err)
+	}
+	defer windows.FreeSid(adminSID)
+
+	var isMember bool
+	err = windows.CheckTokenMembership(token, adminSID, &isMember)
+	if err != nil {
+		return false, fmt.Errorf("CheckTokenMembership: %w", err)
+	}
+	return isMember, nil
+}
+
+// getSystemTokenForSession duplicates the current process (SYSTEM) token,
+// converts it to a primary token, and sets the session ID so the process
+// appears on the correct user desktop when launched with CreateProcessAsUser.
+func getSystemTokenForSession(sessionID uint32) (windows.Token, error) {
+	var procToken windows.Token
+	err := windows.OpenProcessToken(
+		windows.GetCurrentProcess(),
+		windows.TOKEN_ALL_ACCESS,
+		&procToken,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("OpenProcessToken: %w", err)
+	}
+	defer procToken.Close()
+
+	var primaryToken windows.Token
+	err = windows.DuplicateTokenEx(
+		procToken,
+		windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ALL_ACCESS,
+		nil,
+		2, // SecurityImpersonation
+		1, // TokenPrimary
+		&primaryToken,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("DuplicateTokenEx: %w", err)
+	}
+
+	// Set session ID so the process launches on the user's desktop, not Session 0.
+	const tokenSessionID = 32
+	err = windows.SetTokenInformation(
+		primaryToken,
+		tokenSessionID,
+		(*byte)(unsafe.Pointer(&sessionID)),
+		uint32(unsafe.Sizeof(sessionID)),
+	)
+	if err != nil {
+		primaryToken.Close()
+		return 0, fmt.Errorf("SetTokenInformation(SessionId=%d): %w", sessionID, err)
+	}
+
+	return primaryToken, nil
+}
+
 // launchProcessAsUser creates a new process under the specified user token
 // and waits for it to exit. The process runs on winsta0\default (user desktop).
 func launchProcessAsUser(token windows.Token, appPath string, env *uint16) (uint32, error) {
@@ -147,9 +216,9 @@ func launchProcessAsUser(token windows.Token, appPath string, env *uint16) (uint
 	}
 
 	si := &windows.StartupInfo{
-		Cb:        uint32(unsafe.Sizeof(windows.StartupInfo{})),
-		Desktop:   windows.StringToUTF16Ptr("winsta0\\default"),
-		Flags:     windows.STARTF_USESHOWWINDOW,
+		Cb:         uint32(unsafe.Sizeof(windows.StartupInfo{})),
+		Desktop:    windows.StringToUTF16Ptr("winsta0\\default"),
+		Flags:      windows.STARTF_USESHOWWINDOW,
 		ShowWindow: windows.SW_SHOWNORMAL,
 	}
 	pi := &windows.ProcessInformation{}
@@ -160,12 +229,12 @@ func launchProcessAsUser(token windows.Token, appPath string, env *uint16) (uint
 		token,
 		appPathPtr,
 		cmdLine,
-		nil,                                             // process attributes
-		nil,                                             // thread attributes
-		false,                                           // inherit handles
+		nil,   // process attributes
+		nil,   // thread attributes
+		false, // inherit handles
 		createUnicodeEnvironment|createNewConsole,
-		env,                                             // environment block
-		nil,                                             // current directory
+		env, // environment block
+		nil, // current directory
 		si,
 		pi,
 	)
@@ -231,31 +300,62 @@ func launchForActiveSession(appPath string) {
 	}
 	fmt.Printf("✓ Step 3 — DuplicateTokenEx: Primary token obtained\n")
 
-	// Step 4 (optional): Try to get elevated (linked) token
-	elevatedToken, err := getLinkedToken(primaryToken)
+	// Step 4: Determine user type and branch elevation strategy
+	isAdmin, err := isAdminToken(primaryToken)
 	if err != nil {
-		fmt.Printf("— Step 4 — GetLinkedToken: SKIPPED (%v)\n", err)
-		fmt.Println("  (Using primary token — process may launch with filtered privileges)")
-		elevatedToken = primaryToken
+		fmt.Printf("— Admin check FAILED (assuming admin): %v\n", err)
+		isAdmin = true
+	}
+
+	var execToken windows.Token
+	var envToken windows.Token
+
+	if isAdmin {
+		fmt.Printf("  User type: Administrator\n")
+		linked, err := getLinkedToken(primaryToken)
+		if err != nil {
+			fmt.Printf("  — GetLinkedToken: unavailable (%v)\n", err)
+			fmt.Println("  (Using primary token — process runs with admin privileges)")
+			execToken = primaryToken
+		} else {
+			fmt.Printf("✓ Step 4a — GetLinkedToken: Elevated token obtained\n")
+			primaryToken.Close()
+			execToken = linked
+		}
+		envToken = execToken
 	} else {
-		fmt.Printf("✓ Step 4 — GetLinkedToken: Elevated token obtained\n")
-		primaryToken.Close()
+		fmt.Printf("  User type: Standard user — using SYSTEM token for elevation\n")
+		sysToken, err := getSystemTokenForSession(sessionID)
+		if err != nil {
+			fmt.Printf("✗ Step 4a — SYSTEM token for standard user: FAILED\n  %v\n", err)
+			primaryToken.Close()
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Step 4a — SYSTEM token obtained with Session ID %d\n", sessionID)
+		envToken = primaryToken
+		execToken = sysToken
 	}
 
 	// Step 5: Create environment block
-	env, err := createEnvironmentBlock(elevatedToken)
+	env, err := createEnvironmentBlock(envToken)
 	if err != nil {
 		fmt.Printf("✗ Step 5 — CreateEnvironmentBlock: FAILED\n  %v\n", err)
-		elevatedToken.Close()
+		execToken.Close()
+		if !isAdmin {
+			primaryToken.Close()
+		}
 		os.Exit(1)
 	}
 	fmt.Printf("✓ Step 5 — CreateEnvironmentBlock: Environment created\n")
+	if !isAdmin {
+		primaryToken.Close()
+	}
 
 	// Step 6: Launch process
 	fmt.Printf("\n→ Step 6 — Launching: %s\n", appPath)
-	exitCode, err := launchProcessAsUser(elevatedToken, appPath, env)
+	exitCode, err := launchProcessAsUser(execToken, appPath, env)
 	destroyEnvironmentBlock(env)
-	elevatedToken.Close()
+	execToken.Close()
 
 	if err != nil {
 		fmt.Printf("✗ Step 6 — CreateProcessAsUser: FAILED\n  %v\n", err)
